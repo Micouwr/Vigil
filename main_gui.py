@@ -107,7 +107,10 @@ class TicketClassifierApp:
         else:
             self.routing_text.set(f"Routing: {route}")
         
-        self.status_text.set("Classification complete.")
+        if result.get('api_failed'):
+            self.status_text.set("API call failed; ticket routed to human review")
+        else:
+            self.status_text.set("Classification complete.")
     
     def show_error(self, error_message):
         """Shows an error message in the status bar and a popup."""

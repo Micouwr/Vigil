@@ -17,8 +17,9 @@ PII_PATTERNS = [
     # Email Address
     ("email", re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")),
 
-    # Phone Number (matches various US formats)
-    ("phone", re.compile(r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b")),
+    # Phone Number (matches various US formats). The leading lookbehind keeps
+    # the pattern from matching digit runs inside longer numbers.
+    ("phone", re.compile(r"(?<!\d)\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b")),
 ]
 
 REDACTION_TOKENS = {

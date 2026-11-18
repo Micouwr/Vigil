@@ -30,6 +30,9 @@ escalation_rules:
   - "if contains_pii: escalate_to: human_agent"
   - "else: route_to: automated_response"
 
+# Intended-state behavior, not implemented: the notify step below has no
+# notification mechanism behind it. What the code actually does on failure
+# is route the ticket to a human and write the fallback and error logs.
 fallback_protocol:
   - "if LLM fails to classify: route_to: support_queue"
   - "if escalation fails: notify: AI Governance Lead"

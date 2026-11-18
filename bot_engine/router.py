@@ -1,6 +1,5 @@
 import json
 import os
-import warnings
 import yaml
 from pathlib import Path
 from dotenv import load_dotenv
@@ -75,6 +74,18 @@ def prepare_prompt(ticket_text: str) -> str:
     categories_str = ", ".join(TICKET_TYPES)
     return f"{prompt_template.format(categories=categories_str)}\n\nTicket: {ticket_text}"
 
+def _strip_json_fence(response_text: str) -> str:
+    """Removes an optional Markdown fenced-code wrapper around a JSON response."""
+    stripped = response_text.strip()
+    if stripped.startswith("```"):
+        stripped = stripped[3:]
+        if stripped.startswith("json"):
+            stripped = stripped[4:]
+        stripped = stripped.strip()
+        if stripped.endswith("```"):
+            stripped = stripped[:-3]
+    return stripped.strip()
+
 def invoke_llm(prompt: str) -> dict:
     """Invokes the Gemini model and returns the parsed JSON response."""
     if not client:
@@ -84,14 +95,17 @@ def invoke_llm(prompt: str) -> dict:
         response = client.models.generate_content(
             model=MODEL_NAME,
             contents=prompt,
-            config=types.GenerateContentConfig(temperature=0.1)
+            config=types.GenerateContentConfig(
+                temperature=0.1,
+                http_options=types.HttpOptions(timeout=30000)
+            )
         )
         # Extract text from response
-        response_text = response.text
+        response_text = _strip_json_fence(response.text)
         # Assuming response text is a JSON string
         return json.loads(response_text)
     except json.JSONDecodeError as e:
-        raise ValueError(f"LLM returned malformed JSON: {response_text}") from e
+        raise ValueError(f"LLM returned malformed JSON: {response_text[:200]}") from e
     except Exception as e:
         raise ConnectionError(f"API call to Gemini failed: {e}") from e
 
@@ -104,7 +118,11 @@ def process_llm_response(result: dict) -> tuple[str, float]:
         category = "unknown"
         confidence = 0.0 # Confidence is unreliable if category is invalid
 
-    return category, float(confidence)
+    confidence = float(confidence)
+    if not 0.0 <= confidence <= 1.0:
+        raise ValueError(f"LLM returned confidence outside 0.0 to 1.0: {confidence}")
+
+    return category, confidence
 
 # --- Escalation Rules ---
 # The rules below are declared in governance/config/scope.yaml as plain strings,
@@ -164,21 +182,13 @@ def _parse_escalation_rule(rule_str: str):
 def _load_escalation_rules():
     """Parses the escalation_rules list from scope.yaml.
 
-    A malformed rule is skipped, but only with a loud warning naming the rule:
-    a silently dropped rule would degrade governance invisibly, and a dropped
-    confidence rule could let a low-confidence ticket reach automated response.
+    A malformed rule raises ValueError, failing loudly at import: a silently
+    dropped rule would degrade governance invisibly, and a dropped confidence
+    rule could let a low-confidence ticket reach automated response.
     """
     parsed = []
     for rule_str in config.get("escalation_rules", []):
-        try:
-            parsed.append(_parse_escalation_rule(str(rule_str)))
-        except ValueError:
-            warnings.warn(
-                f"Skipping unparseable escalation rule from scope.yaml: {rule_str!r}. "
-                "Governance rules are enforced in order; check the file.",
-                UserWarning,
-                stacklevel=2,
-            )
+        parsed.append(_parse_escalation_rule(str(rule_str)))
     return parsed
 
 ESCALATION_RULES = _load_escalation_rules()
@@ -206,34 +216,41 @@ def classify_ticket(ticket_text: str) -> dict:
             "ticket_type": "unknown",
             "confidence_score": 0.0,
             "contains_pii": False,
-            "model": MODEL_NAME
+            "model": MODEL_NAME,
+            "api_failed": False
         }
         empty_result["routing_decision"] = evaluate_routing(empty_result)
         return empty_result
 
     category = "unknown"
     confidence = 0.0
+    api_failed = False
 
     try:
         prompt = prepare_prompt(ticket_text)
         llm_result = invoke_llm(prompt)
         category, confidence = process_llm_response(llm_result)
     except (ConnectionError, ValueError) as e:
+        api_failed = True
         log_llm_error(ticket_text, str(e))
     except Exception as e:
         # Catch-all for unexpected errors during the process
+        api_failed = True
         log_llm_error(ticket_text, f"An unexpected error occurred: {e}")
 
     # Apply governance layers
     pii_flag = contains_pii(ticket_text)
-    
+
+    # Routing reads the raw confidence; the returned score is rounded below.
     final_result = {
         "ticket_type": category,
-        "confidence_score": round(confidence, 2),
+        "confidence_score": confidence,
         "contains_pii": pii_flag,
-        "model": MODEL_NAME
+        "model": MODEL_NAME,
+        "api_failed": api_failed
     }
     final_result["routing_decision"] = evaluate_routing(final_result)
+    final_result["confidence_score"] = round(confidence, 2)
 
     # Audit logging for low-confidence or failed classifications
     if confidence < CONFIDENCE_THRESHOLD or category == "unknown":
@@ -252,14 +269,14 @@ def log_entry(log_path: Path, entry: dict):
 def log_llm_error(ticket_text: str, error_msg: str):
     """Governance: Log when the AI model fails or returns an invalid response.
 
-    The ticket preview is redacted the same way log_fallback redacts tickets,
-    so raw personal information never lands in the error log. Redaction runs
-    on the full text before truncating, so a PII value cut at the preview
-    boundary cannot leak as a fragment.
+    The ticket preview and the error message are both redacted the same way
+    log_fallback redacts tickets, so raw personal information never lands in
+    the error log. Redaction runs on the full text before truncating, so a
+    PII value cut at the preview boundary cannot leak as a fragment.
     """
     pii_flagged = contains_pii(ticket_text)
     entry = {
-        "error": error_msg,
+        "error": redact_pii(error_msg),
         "ticket_preview": redact_pii(ticket_text)[:100] if pii_flagged else ticket_text[:100],
         "timestamp": datetime.now(timezone.utc).isoformat()
     }

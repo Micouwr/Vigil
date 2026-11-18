@@ -1,9 +1,19 @@
 # tests/test_router.py
 import json
 import shutil
+import pytest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
-from bot_engine.router import classify_ticket, evaluate_routing, _load_escalation_rules, load_config
+from bot_engine.router import (
+    classify_ticket,
+    evaluate_routing,
+    _load_escalation_rules,
+    load_config,
+    process_llm_response,
+    invoke_llm,
+    prepare_prompt,
+    TICKET_TYPES,
+)
 
 # Define a consistent set of ticket types for testing purposes
 MOCK_TICKET_TYPES = [
@@ -290,9 +300,8 @@ def test_llm_failure_redacts_pii_in_error_log(mock_client, tmp_path):
     assert "[REDACTED_SSN]" in fallback_entry["ticket"]
 
 
-def test_load_escalation_rules_warns_on_bad_rule():
-    """A malformed escalation rule is skipped with a loud warning, not silence."""
-    import warnings
+def test_load_escalation_rules_raises_on_bad_rule():
+    """A malformed escalation rule fails loudly, naming the rule, not silence."""
     bad_config = {
         "escalation_rules": [
             "if confidence_score < 0.7: escalate_to: human_agent",
@@ -300,12 +309,22 @@ def test_load_escalation_rules_warns_on_bad_rule():
         ]
     }
     with patch('bot_engine.router.config', bad_config):
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            parsed = _load_escalation_rules()
-    assert len(parsed) == 1
-    assert len(caught) == 1
-    assert "unparseable" in str(caught[0].message).lower()
+        with pytest.raises(ValueError) as excinfo:
+            _load_escalation_rules()
+    assert "this is not a rule" in str(excinfo.value)
+
+
+def test_load_escalation_rules_loads_all_five_in_order():
+    """The shipped scope.yaml rules load as five parsers, in file order."""
+    parsed = _load_escalation_rules()
+    assert len(parsed) == 5
+    assert [rule_text for _, _, rule_text in parsed] == [
+        "if ticket_type == compliance_flag: escalate_to: human_agent",
+        "if ticket_type == unknown: escalate_to: human_agent",
+        "if confidence_score < 0.7: escalate_to: human_agent",
+        "if contains_pii: escalate_to: human_agent",
+        "else: route_to: automated_response",
+    ]
 
 
 def test_load_config_accepts_current_scope():
@@ -330,3 +349,294 @@ def test_load_config_rejects_missing_threshold(tmp_path):
         assert "confidence_threshold" in str(e)
     else:
         raise AssertionError("load_config accepted a config with no confidence threshold")
+
+# --- Code-fix spec: unrounded confidence, validation, fences, timeout, redaction ---
+
+@patch('bot_engine.router.TICKET_TYPES', MOCK_TICKET_TYPES)
+@patch('bot_engine.router.client')
+def test_routing_uses_unrounded_confidence_below_gate(mock_client):
+    """0.696 rounds to 0.7 for display but must still escalate on the raw value."""
+    mock_response = MagicMock()
+    mock_response.text = json.dumps({
+        "category": "technical_support",
+        "confidence": 0.696
+    })
+    mock_client.models.generate_content.return_value = mock_response
+
+    result = classify_ticket("The app is crashing.")
+
+    assert result["routing_decision"]["route"] == "human_agent"
+    assert "confidence_score < 0.7" in result["routing_decision"]["reason"]
+    assert result["confidence_score"] == 0.7
+
+@patch('bot_engine.router.TICKET_TYPES', MOCK_TICKET_TYPES)
+@patch('bot_engine.router.client')
+def test_routing_uses_unrounded_confidence_above_gate(mock_client):
+    """0.704 rounds to 0.7 for display but must still automate on the raw value."""
+    mock_response = MagicMock()
+    mock_response.text = json.dumps({
+        "category": "technical_support",
+        "confidence": 0.704
+    })
+    mock_client.models.generate_content.return_value = mock_response
+
+    result = classify_ticket("The app is crashing.")
+
+    assert result["routing_decision"]["route"] == "automated_response"
+    assert result["confidence_score"] == 0.7
+
+@patch('bot_engine.router.TICKET_TYPES', MOCK_TICKET_TYPES)
+@patch('bot_engine.router.CONFIDENCE_THRESHOLD', 0.5)
+@patch('bot_engine.router.log_fallback')
+@patch('bot_engine.router.client')
+def test_audit_log_uses_unrounded_confidence_below_threshold(mock_client, mock_log_fallback):
+    """0.496 rounds to 0.5 but must still write a fallback log entry."""
+    mock_response = MagicMock()
+    mock_response.text = json.dumps({
+        "category": "technical_support",
+        "confidence": 0.496
+    })
+    mock_client.models.generate_content.return_value = mock_response
+
+    classify_ticket("The app is crashing.")
+
+    mock_log_fallback.assert_called_once()
+
+@patch('bot_engine.router.TICKET_TYPES', MOCK_TICKET_TYPES)
+@patch('bot_engine.router.CONFIDENCE_THRESHOLD', 0.5)
+@patch('bot_engine.router.log_fallback')
+@patch('bot_engine.router.client')
+def test_audit_log_uses_unrounded_confidence_above_threshold(mock_client, mock_log_fallback):
+    """0.504 rounds to 0.5 but must not write a fallback log entry."""
+    mock_response = MagicMock()
+    mock_response.text = json.dumps({
+        "category": "technical_support",
+        "confidence": 0.504
+    })
+    mock_client.models.generate_content.return_value = mock_response
+
+    classify_ticket("The app is crashing.")
+
+    mock_log_fallback.assert_not_called()
+
+@patch('bot_engine.router.TICKET_TYPES', MOCK_TICKET_TYPES)
+@patch('bot_engine.router.log_llm_error')
+@patch('bot_engine.router.log_fallback')
+@patch('bot_engine.router.client')
+def test_confidence_above_one_rejected(mock_client, mock_log_fallback, mock_log_error):
+    """A confidence of 95.0 is rejected: unknown, 0.0, and an error log entry."""
+    mock_response = MagicMock()
+    mock_response.text = json.dumps({
+        "category": "access_request",
+        "confidence": 95.0
+    })
+    mock_client.models.generate_content.return_value = mock_response
+
+    result = classify_ticket("Please reset my password ASAP.")
+
+    assert result["ticket_type"] == "unknown"
+    assert result["confidence_score"] == 0.0
+    mock_log_error.assert_called_once()
+
+@patch('bot_engine.router.TICKET_TYPES', MOCK_TICKET_TYPES)
+@patch('bot_engine.router.log_llm_error')
+@patch('bot_engine.router.log_fallback')
+@patch('bot_engine.router.client')
+def test_confidence_below_zero_rejected(mock_client, mock_log_fallback, mock_log_error):
+    """A confidence of -0.1 is rejected: unknown, and an error log entry."""
+    mock_response = MagicMock()
+    mock_response.text = json.dumps({
+        "category": "access_request",
+        "confidence": -0.1
+    })
+    mock_client.models.generate_content.return_value = mock_response
+
+    result = classify_ticket("Please reset my password ASAP.")
+
+    assert result["ticket_type"] == "unknown"
+    assert result["confidence_score"] == 0.0
+    mock_log_error.assert_called_once()
+
+def test_confidence_boundaries_pass_validation():
+    """0.0 and 1.0 are valid confidences and pass through unchanged."""
+    assert process_llm_response({"category": "access_request", "confidence": 0.0}) == ("access_request", 0.0)
+    assert process_llm_response({"category": "access_request", "confidence": 1.0}) == ("access_request", 1.0)
+
+def test_missing_confidence_defaults_to_zero():
+    """A response without a confidence key defaults to 0.0."""
+    assert process_llm_response({"category": "access_request"}) == ("access_request", 0.0)
+
+@patch('bot_engine.router.TICKET_TYPES', MOCK_TICKET_TYPES)
+@patch('bot_engine.router.log_llm_error')
+@patch('bot_engine.router.log_fallback')
+@patch('bot_engine.router.client')
+def test_string_confidence_fails_closed(mock_client, mock_log_fallback, mock_log_error):
+    """A non-numeric confidence string fails closed: unknown, and an error log entry."""
+    mock_response = MagicMock()
+    mock_response.text = json.dumps({
+        "category": "access_request",
+        "confidence": "high"
+    })
+    mock_client.models.generate_content.return_value = mock_response
+
+    result = classify_ticket("Please reset my password ASAP.")
+
+    assert result["ticket_type"] == "unknown"
+    assert result["confidence_score"] == 0.0
+    mock_log_error.assert_called_once()
+
+@patch('bot_engine.router.TICKET_TYPES', MOCK_TICKET_TYPES)
+@patch('bot_engine.router.log_llm_error')
+@patch('bot_engine.router.log_fallback')
+@patch('bot_engine.router.client')
+def test_none_confidence_fails_closed(mock_client, mock_log_fallback, mock_log_error):
+    """A null confidence fails closed: unknown, and an error log entry."""
+    mock_response = MagicMock()
+    mock_response.text = json.dumps({
+        "category": "access_request",
+        "confidence": None
+    })
+    mock_client.models.generate_content.return_value = mock_response
+
+    result = classify_ticket("Please reset my password ASAP.")
+
+    assert result["ticket_type"] == "unknown"
+    assert result["confidence_score"] == 0.0
+    mock_log_error.assert_called_once()
+
+@patch('bot_engine.router.TICKET_TYPES', MOCK_TICKET_TYPES)
+@patch('bot_engine.router.client')
+def test_fenced_json_response_parses(mock_client):
+    """A response wrapped in a ```json fence parses and classifies normally."""
+    mock_response = MagicMock()
+    mock_response.text = '```json\n{"category": "access_request", "confidence": 0.92}\n```'
+    mock_client.models.generate_content.return_value = mock_response
+
+    result = classify_ticket("Please reset my password ASAP.")
+
+    assert result["ticket_type"] == "access_request"
+    assert result["confidence_score"] == 0.92
+
+@patch('bot_engine.router.TICKET_TYPES', MOCK_TICKET_TYPES)
+@patch('bot_engine.router.client')
+def test_fenced_json_with_surrounding_whitespace_parses(mock_client):
+    """A fenced response with leading and trailing whitespace parses."""
+    mock_response = MagicMock()
+    mock_response.text = '\n\n  ```\n{"category": "billing_question", "confidence": 0.88}\n```  \n\n'
+    mock_client.models.generate_content.return_value = mock_response
+
+    result = classify_ticket("Can you explain this invoice?")
+
+    assert result["ticket_type"] == "billing_question"
+    assert result["confidence_score"] == 0.88
+
+@patch('bot_engine.router.TICKET_TYPES', MOCK_TICKET_TYPES)
+@patch('bot_engine.router.log_llm_error')
+@patch('bot_engine.router.log_fallback')
+@patch('bot_engine.router.client')
+def test_malformed_json_still_fails_closed(mock_client, mock_log_fallback, mock_log_error):
+    """A genuinely malformed response still returns unknown with an error log entry."""
+    mock_response = MagicMock()
+    mock_response.text = 'not json at all'
+    mock_client.models.generate_content.return_value = mock_response
+
+    result = classify_ticket("Please reset my password ASAP.")
+
+    assert result["ticket_type"] == "unknown"
+    assert result["confidence_score"] == 0.0
+    mock_log_error.assert_called_once()
+
+@patch('bot_engine.router.TICKET_TYPES', MOCK_TICKET_TYPES)
+@patch('bot_engine.router.log_llm_error')
+@patch('bot_engine.router.log_fallback')
+@patch('bot_engine.router.client')
+def test_api_failure_sets_api_failed_flag(mock_client, mock_log_fallback, mock_log_error):
+    """A raising LLM call produces api_failed True, unknown, and an error log entry."""
+    mock_client.models.generate_content.side_effect = Exception("API Error")
+
+    result = classify_ticket("My request is urgent.")
+
+    assert result["api_failed"] is True
+    assert result["ticket_type"] == "unknown"
+    assert result["confidence_score"] == 0.0
+    mock_log_error.assert_called_once()
+
+@patch('bot_engine.router.TICKET_TYPES', MOCK_TICKET_TYPES)
+@patch('bot_engine.router.client')
+def test_successful_call_sets_api_failed_false(mock_client):
+    """A successful LLM call produces api_failed False."""
+    mock_response = MagicMock()
+    mock_response.text = json.dumps({
+        "category": "access_request",
+        "confidence": 0.92
+    })
+    mock_client.models.generate_content.return_value = mock_response
+
+    result = classify_ticket("Please reset my password ASAP.")
+
+    assert result["api_failed"] is False
+
+@patch('bot_engine.router.client')
+def test_generate_call_uses_30_second_timeout(mock_client):
+    """The generate call carries http_options with a 30-second timeout."""
+    mock_response = MagicMock()
+    mock_response.text = json.dumps({
+        "category": "access_request",
+        "confidence": 0.92
+    })
+    mock_client.models.generate_content.return_value = mock_response
+
+    invoke_llm("Classify this ticket.")
+
+    config = mock_client.models.generate_content.call_args.kwargs["config"]
+    assert config.http_options.timeout == 30000
+
+def test_error_log_redacts_error_field(tmp_path):
+    """An error string carrying PII is redacted in the written error log entry."""
+    from bot_engine.router import log_llm_error
+    ticket_text = "Please verify my account."
+    error_msg = "LLM returned malformed JSON: {\"ssn\": \"123-45-6789\"}"
+    with patch('bot_engine.router.get_project_root', return_value=tmp_path):
+        log_llm_error(ticket_text, error_msg)
+
+    error_log = tmp_path / "governance" / "llm_error_log.jsonl"
+    entry = json.loads(error_log.read_text().splitlines()[-1])
+    assert "123-45-6789" not in entry["error"]
+    assert "[REDACTED_SSN]" in entry["error"]
+
+@patch('bot_engine.router.client')
+def test_malformed_json_error_bounded_to_200_chars(mock_client):
+    """The malformed-JSON error message carries at most 200 chars of response text."""
+    mock_response = MagicMock()
+    mock_response.text = "x" * 500
+    mock_client.models.generate_content.return_value = mock_response
+
+    with pytest.raises(ValueError) as excinfo:
+        invoke_llm("Classify this ticket.")
+
+    assert str(excinfo.value) == "LLM returned malformed JSON: " + "x" * 200
+
+def test_invalid_category_maps_to_unknown():
+    """A category string outside the configured types maps to unknown with 0.0."""
+    assert process_llm_response({"category": "not_a_category", "confidence": 0.9}) == ("unknown", 0.0)
+
+@patch('bot_engine.router.log_llm_error')
+@patch('bot_engine.router.log_fallback')
+def test_empty_ticket_returns_unknown_without_logging(mock_log_fallback, mock_log_error):
+    """Empty and whitespace-only tickets return unknown with no log write."""
+    for ticket_text in ("", "   "):
+        result = classify_ticket(ticket_text)
+        assert result["ticket_type"] == "unknown"
+        assert result["confidence_score"] == 0.0
+        assert result["api_failed"] is False
+        assert result["routing_decision"]["route"] == "human_agent"
+    mock_log_fallback.assert_not_called()
+    mock_log_error.assert_not_called()
+
+def test_prepare_prompt_formats_ticket_and_categories():
+    """prepare_prompt loads the template and formats in the ticket and categories."""
+    ticket_text = "My printer is jammed."
+    prompt = prepare_prompt(ticket_text)
+    assert ticket_text in prompt
+    assert ", ".join(TICKET_TYPES) in prompt
+    assert "JSON object" in prompt

@@ -111,3 +111,31 @@ def test_log_fallback_keeps_non_pii_text(tmp_path, monkeypatch):
     entry = json.loads(log_file.read_text().strip().splitlines()[0])
     assert entry["ticket"] == ticket
     assert "pii_types" not in entry
+
+# --- Code-fix spec: phone-pattern boundary keeps the Luhn gate ---
+
+def test_luhn_failing_digit_run_not_flagged_or_redacted():
+    """A 16-digit run failing Luhn is neither flagged nor redacted (Luhn gate kept)."""
+    text = "Card 4532015112830367 on file."
+    assert detect_pii_types(text) == []
+    assert contains_pii(text) is False
+    assert redact_pii(text) == text
+
+def test_luhn_failing_formatted_card_not_flagged_or_redacted():
+    """A formatted card number failing Luhn is neither flagged nor redacted."""
+    text = "Card 4532-0151-1283-0367 on file."
+    assert detect_pii_types(text) == []
+    assert contains_pii(text) is False
+    assert redact_pii(text) == text
+
+def test_phone_at_start_of_string():
+    """A phone number at the start of the string still flags and redacts."""
+    text = "555-123-4567 is my number."
+    assert detect_pii_types(text) == ["phone"]
+    assert redact_pii(text) == "[REDACTED_PHONE] is my number."
+
+def test_phone_after_space():
+    """A phone number after a space still flags and redacts."""
+    text = "Call 555-123-4567."
+    assert detect_pii_types(text) == ["phone"]
+    assert redact_pii(text) == "Call [REDACTED_PHONE]."
