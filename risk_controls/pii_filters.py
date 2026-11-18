@@ -90,8 +90,9 @@ def detect_pii_types(text: str) -> list:
 def redact_pii(text: str) -> str:
     """
     Replaces detected PII in the text with redaction tokens such as [REDACTED_SSN].
-    Used before writing tickets to the fallback log so personal information is
-    never stored in log files. Non-string input is returned unchanged.
+    Covers 4 PII types only: dashed SSN, card numbers that pass the Luhn
+    check, email, US phone. Other types are left unchanged. Non-string
+    input is returned unchanged.
     """
     if not isinstance(text, str):
         return text

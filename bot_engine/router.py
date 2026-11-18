@@ -5,7 +5,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
-from risk_controls.pii_filters import contains_pii, redact_pii, detect_pii_types
+from risk_controls.pii_filters import contains_pii, redact_pii, detect_pii_types, REDACTION_TOKENS
 from datetime import datetime, timezone
 
 # --- Configuration Loading ---
@@ -208,6 +208,11 @@ def evaluate_routing(result: dict) -> dict:
 def classify_ticket(ticket_text: str) -> dict:
     """
     Classifies a support ticket using the Gemini 3 Flash model with governance layers.
+
+    PII detection and redaction run before the prompt is built. The ticket
+    text sent to the model is redacted, and the PII flag from pre-redaction
+    detection still forces human routing. If detection or redaction fails,
+    the ticket fails closed to human review with no model call.
     
     Complies with ISO/IEC 42001:2023 requirements for AI system operation and monitoring.
     """
@@ -226,20 +231,61 @@ def classify_ticket(ticket_text: str) -> dict:
     confidence = 0.0
     api_failed = False
 
+    # PII preprocessing runs before any model call. Detection reads the
+    # original text; redaction produces a separate variable. ticket_text
+    # is never overwritten, so logging still receives the original text.
+    pii_types = []
+    failure_kind = None
     try:
-        prompt = prepare_prompt(ticket_text)
-        llm_result = invoke_llm(prompt)
-        category, confidence = process_llm_response(llm_result)
-    except (ConnectionError, ValueError) as e:
-        api_failed = True
-        log_llm_error(ticket_text, str(e))
-    except Exception as e:
-        # Catch-all for unexpected errors during the process
-        api_failed = True
-        log_llm_error(ticket_text, f"An unexpected error occurred: {e}")
+        pii_types = detect_pii_types(ticket_text)
+    except Exception:
+        failure_kind = "detection"
+    if failure_kind is None:
+        try:
+            redacted_text = redact_pii(ticket_text)
+        except Exception:
+            failure_kind = "redaction"
+    if failure_kind is not None:
+        failed_result = {
+            "ticket_type": "unknown",
+            "confidence_score": 0.0,
+            "contains_pii": True,
+            "model": MODEL_NAME,
+            "api_failed": False
+        }
+        failed_result["routing_decision"] = evaluate_routing(failed_result)
+        entry = {
+            "ticket": f"[Ticket withheld: PII {failure_kind} failed]",
+            "result": failed_result,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+        if failure_kind == "detection":
+            entry["detection_failed"] = True
+        else:
+            entry["redaction_failed"] = True
+            entry["pii_types"] = pii_types
+        log_entry(get_project_root() / "fallback_log.jsonl", entry)
+        return failed_result
+    pii_flag = len(pii_types) > 0
 
-    # Apply governance layers
-    pii_flag = contains_pii(ticket_text)
+    # Meaningful-text check: strip the redaction tokens and whitespace.
+    # A ticket with nothing left skips the model call and keeps the
+    # step 2 flag, so literal token text alone does not count as PII.
+    remaining = redacted_text
+    for token in REDACTION_TOKENS.values():
+        remaining = remaining.replace(token, "")
+    if remaining.strip():
+        try:
+            prompt = prepare_prompt(redacted_text)
+            llm_result = invoke_llm(prompt)
+            category, confidence = process_llm_response(llm_result)
+        except (ConnectionError, ValueError) as e:
+            api_failed = True
+            log_llm_error(ticket_text, str(e))
+        except Exception as e:
+            # Catch-all for unexpected errors during the process
+            api_failed = True
+            log_llm_error(ticket_text, f"An unexpected error occurred: {e}")
 
     # Routing reads the raw confidence; the returned score is rounded below.
     final_result = {
@@ -269,10 +315,12 @@ def log_entry(log_path: Path, entry: dict):
 def log_llm_error(ticket_text: str, error_msg: str):
     """Governance: Log when the AI model fails or returns an invalid response.
 
-    The ticket preview and the error message are both redacted the same way
-    log_fallback redacts tickets, so raw personal information never lands in
-    the error log. Redaction runs on the full text before truncating, so a
-    PII value cut at the preview boundary cannot leak as a fragment.
+    The error message is always redacted. The ticket preview is redacted
+    only when the ticket is flagged; unflagged tickets store a raw preview.
+    Redaction covers 4 PII types only, and pii_types are derived from the
+    original text. When the preview is redacted, redaction runs on the full
+    text before truncating, so a PII value cut at the preview boundary
+    cannot leak as a fragment.
     """
     pii_flagged = contains_pii(ticket_text)
     entry = {
@@ -288,9 +336,10 @@ def log_llm_error(ticket_text: str, error_msg: str):
 def log_fallback(ticket_text: str, result: dict):
     """Governance: Log low-confidence or unknown classifications for human review.
 
-    Tickets flagged for PII are logged with personal information redacted; the
-    entry records which PII types were found instead of their values, so the
-    log file never stores raw personal information.
+    Tickets flagged for PII are logged with the 4 detected PII types
+    redacted; the entry records which PII types were found, derived from
+    the original text, instead of their values. Unflagged tickets store
+    full text, and types outside the 4 detected types are stored as written.
     """
     pii_flagged = bool(result.get("contains_pii"))
     entry = {

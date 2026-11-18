@@ -28,8 +28,8 @@ The goal is not to eliminate human oversight. The goal is to make human oversigh
 
 ```mermaid
 flowchart TD
-    A[Ticket] --> B[Gemini classification]
-    B --> C[PII detection]
+    A[Ticket] --> B[PII detection and redaction]
+    B --> C[Gemini classification, redacted text]
     C --> D[Escalation rules, checked in order]
     D -->|Compliance flag, unknown type, confidence below 0.7, or PII| E[Human review]
     D -->|No rule applies| F[Automated response]
@@ -37,6 +37,8 @@ flowchart TD
 ```
 
 Every check can divert the ticket to a human. The escalation rules are enforced in code (`governance/config/scope.yaml`), not left to the model's judgment.
+
+PII handling: PII detection and redaction run before ticket content is included in a Gemini prompt. The original ticket text is not submitted to Gemini. Redaction covers 4 types only: dashed SSN, card numbers that pass the Luhn check, email, US phone. Names, addresses, birth dates, unformatted SSNs, non-US phones, and other types are not detected or redacted and may reach the model and may be stored in logs. A card-like number that fails the Luhn check is treated as not PII, is not redacted, and may reach the model. Redaction is a privacy control. It does not authorize sending or acting. Send-ready and action-ready gates are judged on pre-redaction detection and remain independent. Unflagged tickets store full text in logs. Flagged tickets store text redacted for the 4 types only.
 
 ---
 
