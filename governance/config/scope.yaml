@@ -11,7 +11,6 @@ intended_use:
   - Log decisions for audit and compliance
 
 bot_config:
-  confidence_threshold: 0.5
   model_name: "gemini-3.8-flash"
 
 ticket_types:

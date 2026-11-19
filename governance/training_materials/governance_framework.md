@@ -191,7 +191,7 @@ ISO/IEC 42001:2023 is the international standard for **Artificial Intelligence M
 
 **Evidence Files:**
 - `main_gui.py` (displays confidence scores)
-- `fallback_log.jsonl`, `governance/llm_error_log.jsonl`
+- `logs/YYYY-MM-DD.jsonl` (per-day decision log files), `fallback_log.jsonl` (legacy, when present), `governance/llm_error_log.jsonl`
 - `tools/fallback_viewer.py`
 
 #### 7.5 Data Management
@@ -273,7 +273,7 @@ ISO/IEC 42001:2023 is the international standard for **Artificial Intelligence M
 - **Reporting:** Weekly/monthly review templates provided
 
 **Evidence Files:**
-- `fallback_log.jsonl`
+- `logs/YYYY-MM-DD.jsonl` (per-day decision log files), `fallback_log.jsonl` (legacy, when present)
 - `governance/llm_error_log.jsonl`
 - `tools/fallback_viewer.py`
 - `governance/training_materials/reviewer_handbook.md` (metrics section)
@@ -370,12 +370,14 @@ ISO/IEC 42001:2023 is the international standard for **Artificial Intelligence M
 | Metric | Target | Measurement Frequency | Data Source |
 |--------|--------|----------------------|-------------|
 | **Classification Accuracy** | ≥ 85% | Monthly | Fallback log human review |
-| **Average Confidence Score** | ≥ 0.70 | Weekly | Fallback log analysis |
-| **Fallback Rate** | < 30% | Weekly | Fallback log count / total tickets |
+| **Average Confidence Score** | ≥ 0.70 | Weekly | Mean over completed decisions with valid finite numeric confidence (Fix 4 population), excluding API failures, preprocessing failures, and model skips |
+| **Human Routing Rate** | < 30% | Weekly | Human-routed completed decisions divided by all completed decisions in the viewer population (see note below) |
 | **PII False Positive Rate** | < 10% | Quarterly | PII detection audit |
 | **PII False Negative Rate** | < 5% | Quarterly | PII detection audit |
 | **API Error Rate** | < 5% | Daily | Error log analysis |
 | **Average Response Time** | < 5 seconds | Monthly | Performance benchmarks |
+
+Note: Human Routing Rate equals human-routed completed classifier decisions divided by all completed classifier decisions represented by dictionary-shaped JSON entries successfully loaded by the viewer. The definition and exclusions are those in Fix 4 of the logging spec, including model_skip excluded, and a zero denominator is reported as unavailable. The statistics describe the available recorded population, not a guaranteed complete population of all attempts.
 
 ### Compliance Metrics
 

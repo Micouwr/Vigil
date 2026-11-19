@@ -1,4 +1,5 @@
 # tests/test_pii_filters.py
+import uuid
 import pytest
 from risk_controls.pii_filters import contains_pii, redact_pii, detect_pii_types
 
@@ -87,12 +88,14 @@ def test_log_fallback_redacts_pii(tmp_path, monkeypatch):
     from bot_engine import router
     monkeypatch.setattr(router, "get_project_root", lambda: tmp_path)
     ticket = "My SSN is 123-45-6789."
-    result = {"ticket_type": "unknown", "confidence_score": 0.4, "contains_pii": True}
+    result = {"ticket_type": "unknown", "confidence_score": 0.4, "contains_pii": True,
+              "decision_id": str(uuid.uuid4())}
     router.log_fallback(ticket, result)
 
     import json
-    log_file = tmp_path / "fallback_log.jsonl"
-    entry = json.loads(log_file.read_text().strip().splitlines()[0])
+    day_files = sorted((tmp_path / "logs").glob("*.jsonl"))
+    assert len(day_files) == 1
+    entry = json.loads(day_files[0].read_text().strip().splitlines()[0])
     assert "123-45-6789" not in entry["ticket"]
     assert "[REDACTED_SSN]" in entry["ticket"]
     assert entry["pii_types"] == ["ssn"]
@@ -103,12 +106,14 @@ def test_log_fallback_keeps_non_pii_text(tmp_path, monkeypatch):
     from bot_engine import router
     monkeypatch.setattr(router, "get_project_root", lambda: tmp_path)
     ticket = "The app is crashing."
-    result = {"ticket_type": "software_issue", "confidence_score": 0.4, "contains_pii": False}
+    result = {"ticket_type": "software_issue", "confidence_score": 0.4, "contains_pii": False,
+              "decision_id": str(uuid.uuid4())}
     router.log_fallback(ticket, result)
 
     import json
-    log_file = tmp_path / "fallback_log.jsonl"
-    entry = json.loads(log_file.read_text().strip().splitlines()[0])
+    day_files = sorted((tmp_path / "logs").glob("*.jsonl"))
+    assert len(day_files) == 1
+    entry = json.loads(day_files[0].read_text().strip().splitlines()[0])
     assert entry["ticket"] == ticket
     assert "pii_types" not in entry
 

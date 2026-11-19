@@ -104,7 +104,7 @@ This document provides a comprehensive mapping between the Vigil prototype's fea
 
 | Risk/Opportunity | Implementation | Evidence | Status |
 |------------------|----------------|----------|--------|
-| **Risk:** Inaccurate ticket classification | Confidence scoring with 0.50 threshold, fallback logging for human review | `bot_engine/router.py`, `fallback_log.jsonl` | IMPLEMENTED |
+| **Risk:** Inaccurate ticket classification | Confidence scoring with fallback logging of every controlled decision that reaches the logging step | `bot_engine/router.py`, `fallback_log.jsonl` | IMPLEMENTED |
 | **Risk:** PII exposure in tickets | Regex-based PII detection with multiple pattern types (SSN, credit cards, emails, phone numbers, Luhn algorithm for card validation) | `risk_controls/pii_filters.py` | IMPLEMENTED |
 | **Risk:** API failures/outages | Comprehensive error handling, graceful degradation to "unknown" classification | `bot_engine/router.py`, error logging | IMPLEMENTED |
 | **Risk:** Rate limiting (low free-tier limits) | Documented in AI policy as operational constraint | `governance/ai_policy.md` Section 3.1 | IMPLEMENTED |
@@ -217,7 +217,7 @@ This document provides a comprehensive mapping between the Vigil prototype's fea
 
 | Requirement | Implementation | Evidence | Status |
 |-------------|----------------|----------|--------|
-| Monitor AI system performance | Fallback logging of low-confidence classifications | `fallback_log.jsonl` | IMPLEMENTED |
+| Monitor AI system performance | Fallback logging of every controlled decision that reaches the logging step | `fallback_log.jsonl` | IMPLEMENTED |
 | Analyze performance data | Fallback viewer tool with filtering, statistics, and export capabilities | `tools/fallback_viewer.py` | IMPLEMENTED |
 | Track key metrics | Confidence scores, category distribution, PII detection rates | `tools/fallback_viewer.py` output | IMPLEMENTED |
 

@@ -33,10 +33,10 @@ flowchart TD
     C --> D[Escalation rules, checked in order]
     D -->|Compliance flag, unknown type, confidence below 0.7, or PII| E[Human review]
     D -->|No rule applies| F[Automated response]
-    E --> G[Audit log: confidence below 0.5 or unknown, PII redacted]
+    E --> G[Decision log: every controlled decision reaching the logging step, per-day files, PII redacted]
 ```
 
-Every check can divert the ticket to a human. The escalation rules are enforced in code (`governance/config/scope.yaml`), not left to the model's judgment.
+Every check can divert the ticket to a human. The escalation rules are enforced in code (`governance/config/scope.yaml`), not left to the model's judgment. An unexpected classification exception before a usable result reaches the logging step has no primary record.
 
 PII handling: PII detection and redaction run before ticket content is included in a Gemini prompt. The original ticket text is not submitted to Gemini. Redaction covers 4 types only: dashed SSN, card numbers that pass the Luhn check, email, US phone. Names, addresses, birth dates, unformatted SSNs, non-US phones, and other types are not detected or redacted and may reach the model and may be stored in logs. A card-like number that fails the Luhn check is treated as not PII, is not redacted, and may reach the model. Redaction is a privacy control. It does not authorize sending or acting. Send-ready and action-ready gates are judged on pre-redaction detection and remain independent. Unflagged tickets store full text in logs. Flagged tickets store text redacted for the 4 types only.
 
@@ -236,12 +236,11 @@ Vigil/
 **Location:** `governance/config/scope.yaml`
 
 Key settings:
-- `confidence_threshold`: Audit threshold (default: 0.5). Predictions scored below this are written to the fallback log for audit. This is separate from the routing threshold below.
 - `model_name`: AI model to use (default: "gemini-3.8-flash")
 - `ticket_types`: List of classification categories
 - `escalation_rules`: Rules for human escalation, including routing anything with confidence below 0.7 to a human
 
-Two different thresholds, two different jobs. The 0.5 audit threshold decides what gets logged. The 0.7 routing threshold decides what goes to a human. Both are initial operating values, not derived from production data. They separate "uncertain" from "confident" behavior until real ticket volume is available for calibration.
+One threshold, one job. The 0.7 routing threshold decides what goes to a human. Every decision is logged, whatever its confidence. The 0.7 routing threshold is an initial operating value, not derived from production data. It separates "uncertain" from "confident" behavior until real ticket volume is available for calibration.
 
 ### Ticket Categories
 
@@ -261,7 +260,8 @@ Two different thresholds, two different jobs. The 0.5 audit threshold decides wh
 
 | File | Purpose | Location |
 |------|---------|----------|
-| `fallback_log.jsonl` | Low-confidence classifications | Project root |
+| `logs/YYYY-MM-DD.jsonl` | A primary decision-record attempt for every controlled decision that reaches the logging step | `logs/` |
+| `fallback_log.jsonl` | Legacy file, readable by the viewer when present | Project root |
 | `governance/llm_error_log.jsonl` | API errors and failures | `governance/` |
 
 ### Using the Fallback Viewer
@@ -278,9 +278,22 @@ python tools/fallback_viewer.py --stats-only
 # Filter by confidence score
 python tools/fallback_viewer.py --max-confidence 0.3
 
+# Filter by route
+python tools/fallback_viewer.py --route human_agent
+
+# Search by decision ID, source ticket ID, subject, sender, or text
+python tools/fallback_viewer.py --decision-id <decision-id>
+python tools/fallback_viewer.py --source-ticket-id <source-ticket-id>
+python tools/fallback_viewer.py --subject <subject>
+python tools/fallback_viewer.py --sender <sender>
+python tools/fallback_viewer.py --sender-domain <domain>
+python tools/fallback_viewer.py --search <text>
+
 # Export to CSV
 python tools/fallback_viewer.py --export report.csv
 ```
+
+Every non-empty attempt that produces a controlled result and reaches the primary logging step receives a primary decision-record attempt. A record is confirmed only when persistence succeeds. Unexpected classification exceptions before the logging step have no primary record in JSONL v1. Each decision gets a UUIDv4 decision ID assigned when the ticket arrives, and the log entry carries the decision ID, the optional source ticket ID, subject, and sender when supplied, and the routing decision. Decision log entries are stored in per-day files under `logs/` (one file per day, `logs/YYYY-MM-DD.jsonl`). The viewer loads the day files plus the legacy `fallback_log.jsonl` when present, and supports search by decision ID, source ticket ID, subject, sender, sender domain, and free text. A failed write is reported as "Persistence not confirmed". The viewer population is dictionary-shaped JSON entries successfully loaded by the viewer, not a guaranteed list of confirmed operations. The log is single-writer: the router is the only writer. There is no automatic deletion, rotation, or enforced retention period, and the operator is responsible for deleting old day files. Diagnostic fields about a failed write (record status, failure category, error type) appear in the returned result only and are never stored in the log entry.
 
 **See:** `tools/README.md` for detailed usage instructions
 
@@ -348,8 +361,9 @@ This system implements governance controls aligned with ISO/IEC 42001:2023:
 ```bash
 # Linux/Mac: Restrict sensitive files
 chmod 600 .env
-chmod 640 fallback_log.jsonl
-chmod 640 governance/llm_error_log.jsonl
+chmod 700 logs
+find logs -maxdepth 1 -name '*.jsonl' -exec chmod 600 {} +
+chmod 600 governance/llm_error_log.jsonl
 ```
 
 ---
@@ -364,8 +378,8 @@ chmod 640 governance/llm_error_log.jsonl
 **Issue: Rate limit exceeded**
 - **Solution:** Free tier allows only a small number of requests per day. If you hit the limit, wait until the quota resets (midnight Pacific) or upgrade the API plan.
 
-**Issue: High fallback rate (>40%)**
-- **Solution:** Review `governance/config/scope.yaml` and consider adjusting `confidence_threshold`
+**Issue: High Human Routing Rate (>40%)**
+- **Solution:** Review the routing rules in `governance/config/scope.yaml` and the routing reasons in the log to find what is routing to a human. The 0.7 routing threshold is an initial operating value; change it only with a calibration basis, not to chase a rate. A lower Human Routing Rate is not automatically an improvement: it could mean less oversight.
 
 **Issue: PII false positives**
 - **Solution:** Review patterns in `risk_controls/pii_filters.py` and add test cases

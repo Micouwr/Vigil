@@ -171,7 +171,6 @@ description: >
   with ISO/IEC 42001:2023.
 
 bot_config:
-  confidence_threshold: 0.5      # Adjust based on accuracy requirements
   model_name: "gemini-3.8-flash" # Model selection
 
 ticket_types:
@@ -192,24 +191,11 @@ escalation_rules:
 
 ---
 
-### Tuning Confidence Threshold
+### Logging and the Routing Threshold
 
-**Current Default:** 0.5 (50%)
+Logging is unconditional: every non-empty attempt that produces a controlled result and reaches the primary logging step receives a primary decision-record attempt, stored in a per-day file under `logs/`. There is no audit threshold and no separate log threshold to tune.
 
-**Adjustment Guidelines:**
-
-| Threshold | Effect | Use Case |
-|-----------|--------|----------|
-| 0.3 (30%) | More auto-classifications, higher error rate | High-volume, low-risk tickets |
-| 0.5 (50%) | Balanced (recommended) | General purpose |
-| 0.7 (70%) | Fewer auto-classifications, lower error rate | High-stakes tickets |
-
-**To Change:**
-1. Edit `governance/config/scope.yaml`
-2. Modify `confidence_threshold: 0.5` to desired value
-3. Restart application
-4. Monitor fallback log for 1 week
-5. Adjust as needed based on accuracy metrics
+Routing uses the 0.7 rule in escalation_rules: a ticket with a confidence score below 0.7 routes to a human. The 0.7 routing threshold is an initial operating value, not derived from production data. Change it only with a calibration basis, not to chase a rate.
 
 ---
 
@@ -275,20 +261,21 @@ escalation_rules:
 
 | Log File | Purpose | Location | Retention |
 |----------|---------|----------|-----------|
-| `fallback_log.jsonl` | Low-confidence classifications | Project root | 90 days |
+| `logs/YYYY-MM-DD.jsonl` | Every controlled decision that reaches the logging step, one file per day | `logs/` | Manual deletion, no enforced period |
+| `fallback_log.jsonl` | Legacy file, readable by the viewer when present | Project root | Manual deletion, no enforced period |
 | `governance/llm_error_log.jsonl` | API failures and errors | `governance/` | 90 days |
 
 ---
 
-### Monitoring Fallback Log
+### Monitoring the Decision Log
 
 **Daily Check:**
 ```bash
 # Count entries from today
-grep "$(date +%Y-%m-%d)" fallback_log.jsonl | wc -l
+grep "$(date +%Y-%m-%d)" logs/$(date +%Y-%m-%d).jsonl | wc -l
 
 # View last 10 entries
-tail -n 10 fallback_log.jsonl | jq .
+tail -n 10 logs/$(date +%Y-%m-%d).jsonl | jq .
 ```
 
 **Weekly Analysis:**
@@ -297,9 +284,9 @@ python tools/fallback_viewer.py --date-range 7 --stats-only
 ```
 
 **Alert Thresholds:**
-- **Warning:** > 20% of tickets in fallback log
-- **Critical:** > 40% of tickets in fallback log
-- **Action:** Review prompt tuning or confidence threshold
+- **Warning:** Human Routing Rate above 20%
+- **Critical:** Human Routing Rate above 40%
+- **Action:** Review routing reasons in the decision log. A lower Human Routing Rate is not automatically an improvement: it could mean less oversight.
 
 ---
 
@@ -516,9 +503,10 @@ Before deploying updates:
 # Restrict .env file
 chmod 600 .env
 
-# Restrict log files (readable by admin group only)
-chmod 640 fallback_log.jsonl
-chmod 640 governance/llm_error_log.jsonl
+# Restrict log files
+chmod 700 logs
+find logs -maxdepth 1 -name '*.jsonl' -exec chmod 600 {} +
+chmod 600 governance/llm_error_log.jsonl
 ```
 
 **Windows:**
@@ -606,10 +594,10 @@ grep "exhausted" governance/llm_error_log.jsonl
 
 ---
 
-### Issue: High Fallback Rate (> 40%)
+### Issue: High Human Routing Rate (> 40%)
 
 **Symptoms:**
-- Many tickets appearing in fallback log
+- Many tickets routing to human review
 - Low average confidence scores
 
 **Diagnosis:**
@@ -619,9 +607,9 @@ python tools/fallback_viewer.py --date-range 7 --stats-only
 
 **Possible Causes:**
 
-1. **Confidence threshold too high**
+1. **Routing threshold needs calibration**
    - Review `governance/config/scope.yaml`
-   - Consider lowering from 0.5 to 0.4
+   - Change the 0.7 routing threshold only with a calibration basis, not to chase a rate
 
 2. **Prompt needs tuning**
    - Review `prompts/classification_prompt.txt`
@@ -629,7 +617,7 @@ python tools/fallback_viewer.py --date-range 7 --stats-only
    - Provide examples in prompt
 
 3. **New ticket types emerging**
-   - Analyze fallback log for patterns
+   - Analyze the decision log for patterns
    - Consider adding new categories
 
 ---
@@ -893,8 +881,8 @@ python -c "from dotenv import load_dotenv; import os; load_dotenv(); print('Key 
 # Monitor errors
 tail -f governance/llm_error_log.jsonl | jq .
 
-# Count today's fallbacks
-grep "$(date +%Y-%m-%d)" fallback_log.jsonl | wc -l
+# Count today's decisions
+grep "$(date +%Y-%m-%d)" logs/$(date +%Y-%m-%d).jsonl | wc -l
 ```
 
 ---

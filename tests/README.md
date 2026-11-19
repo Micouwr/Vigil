@@ -18,7 +18,9 @@ tests/
 ├── README.md              (This file)
 ├── __init__.py           (Package initialization)
 ├── test_router.py        (Classification engine tests)
-└── test_pii_filters.py   (PII detection tests)
+├── test_pii_filters.py   (PII detection tests)
+├── test_fallback_viewer.py (Decision log viewer tests)
+└── test_gui_status.py    (GUI status text tests)
 ```
 
 ---
@@ -29,7 +31,7 @@ tests/
 
 **Purpose:** Validate core classification logic and error handling  
 **Coverage:** Classification engine, API integration, fallback logging  
-**Test Count:** 18 tests  
+**Test Count:** 99 tests (verified 2026-11-19, full-decision logging build)
 
 **Test Scenarios:**
 - ✅ Standard ticket classification (access_request, billing_question, etc.)
@@ -53,7 +55,7 @@ tests/
 
 **Purpose:** Validate PII detection accuracy and prevent false positives/negatives  
 **Coverage:** SSN, credit cards, emails, phone numbers  
-**Test Count:** 25 tests (parameterized)  
+**Test Count:** 29 tests (verified 2026-11-19, full-decision logging build)
 
 **Positive Test Cases (Should Detect PII):**
 - ✅ SSN format: 123-45-6789
@@ -75,6 +77,24 @@ tests/
 - Luhn algorithm validation for credit cards (reduces false positives)
 - Parameterized tests for efficiency
 - Edge case coverage
+
+---
+
+### 3. Decision Log Viewer Tests (`test_fallback_viewer.py`)
+
+**Purpose:** Validate the decision log viewer: multi-file loading, filters, statistics, and CSV export  
+**Coverage:** Day-file plus legacy loading, route/decision-ID/source-ticket-ID/subject/sender/sender-domain/text filters, Human Routing Rate and average confidence populations, formula-injection protection in CSV export, malformed-line tolerance  
+**Test Count:** 28 tests (verified 2026-11-19, full-decision logging build)
+
+---
+
+### 4. GUI Status Tests (`test_gui_status.py`)
+
+**Purpose:** Validate the GUI status text composition without opening a window  
+**Coverage:** Processing plus persistence status wording across the full matrix of preprocessing failure, API failure, model skip, and persistence outcomes; the status never claims "Not recorded"  
+**Test Count:** 32 tests (verified 2026-11-19, full-decision logging build)
+
+**Total test count (verified 2026-11-19):** 188 tests (99 router, 29 PII filters, 28 viewer, 32 GUI status), all passing.
 
 ---
 

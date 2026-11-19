@@ -12,5 +12,6 @@ tests/.venv/
 **/.venv/
 
 # Runtime logs (may contain ticket text; never commit)
+logs/
 fallback_log.jsonl
 governance/llm_error_log.jsonl

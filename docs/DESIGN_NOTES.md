@@ -1,14 +1,10 @@
 # Design Notes
 
-## Why the confidence threshold is 0.5
+## Why logging is unconditional and routing uses 0.7
 
-The 0.5 threshold is an audit threshold, not a routing threshold. Anything the model scores below 0.5 gets written to the fallback log so there's a record of predictions the model wasn't particularly confident about.
+There is no audit threshold. All controlled decisions reaching the primary logging step receive a decision-record attempt, whatever their confidence. Tickets with confidence below 0.7 route to human review under the escalation rules.
 
-It's intentionally low. The goal is to capture genuinely uncertain cases without filling the log with tickets that are clearly categorized.
-
-Routing is stricter. A separate rule sends anything below 0.7 to human review instead of allowing a fully automated response. That creates a review band between 0.5 and 0.7 where tickets can still be analyzed automatically while being captured for audit and evaluation purposes. Below 0.7, a person reviews the ticket.
-
-Neither threshold was derived from production data. They are initial operating values chosen to separate "uncertain" from "confident" behavior until real ticket volume is available for calibration.
+The 0.7 routing threshold is an initial operating value, not derived from production data. It separates "uncertain" from "confident" behavior until real ticket volume is available for calibration.
 
 ## What human review catches
 
@@ -27,7 +23,7 @@ The goal is not to eliminate mistakes. The goal is to ensure mistakes are caught
 
 ## What I would change before production
 
-- Replace the fixed 0.5 and 0.7 thresholds with values derived from production data and measured review outcomes.
+- Replace the fixed 0.7 routing threshold with a value derived from production data and measured review outcomes.
 - Expand the evaluation dataset with a larger and more representative sample of real-world tickets.
 - Use independent reviewers to label evaluation data instead of relying solely on my own classifications.
 - Add operational monitoring for accuracy drift, latency, routing rates, review volume, and system errors.

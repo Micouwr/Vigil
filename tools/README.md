@@ -26,20 +26,29 @@ tools/
 
 ### Fallback Log Viewer (`fallback_viewer.py`)
 
-**Purpose:** Human-readable interface for reviewing low-confidence ticket classifications
+**Purpose:** Human-readable interface for reviewing every classification decision in the decision log
 **ISO Clause:** 9.1 (Monitoring), 9.2 (Internal Audit), 10.2 (Continual Improvement)
 **Status:** ACTIVE
 **Version:** 1.0
 
 **Features:**
-- ✅ Load and parse JSONL fallback logs
+- ✅ Load and parse decision log day files plus the legacy fallback log
 - ✅ Filter by date range
 - ✅ Filter by confidence score
 - ✅ Filter by ticket category
 - ✅ Filter by PII detection status
+- Filter by route, decision ID, source ticket ID, subject, sender, sender domain, and free text
 - ✅ Generate summary statistics
 - ✅ Export results to CSV
 - ✅ Display human-readable log entries
+
+**Loading:** The viewer loads the per-day files under `logs/` (one file per day, `logs/YYYY-MM-DD.jsonl`) plus the legacy `fallback_log.jsonl` when present. A `--log-path` argument loads only the single file named.
+
+**Viewer population:** The viewer population is dictionary-shaped JSON entries successfully loaded by the viewer. A record_failed attempt may still appear as a complete-looking parseable entry, and the viewer cannot distinguish such an entry from a confirmed write.
+
+**Human Routing Rate:** Human Routing Rate equals human-routed completed classifier decisions divided by all completed classifier decisions represented by the viewer population. API failures, PII preprocessing failures, and meaningful-text skips (model_skip True) are excluded from the denominator and reported separately. A zero denominator is reported as unavailable. The statistics describe the available recorded population, not a guaranteed complete population of all attempts. A lower Human Routing Rate is not automatically an improvement: it could mean less oversight.
+
+**Average confidence:** Average confidence is the mean over completed decisions with a valid finite numeric confidence score, excluding API failures, preprocessing failures, and model skips. The same population rule applies to the average by route.
 
 ---
 
@@ -75,13 +84,20 @@ python tools/fallback_viewer.py --date-range 30 --export report.csv
 python tools/fallback_viewer.py [OPTIONS]
 
 Options:
---log-path PATH         Path to fallback log file (default: fallback_log.jsonl)
+--log-path PATH         Path to a single log file to load (default: all day files under logs/ plus the legacy fallback log when present)
 --date-range DAYS       Show entries from last N days
 --min-confidence X      Filter by minimum confidence score (0.0-1.0)
 --max-confidence X      Filter by maximum confidence score (0.0-1.0)
 --category CAT          Filter by ticket category
 --contains-pii          Show only PII-flagged tickets
 --no-pii                Show only tickets WITHOUT PII
+--route ROUTE           Filter by routing decision (human_agent or automated_response)
+--decision-id ID        Filter by decision ID (exact match)
+--source-ticket-id ID   Filter by source ticket ID (exact match)
+--subject TEXT          Filter by subject (substring)
+--sender TEXT           Filter by sender (substring)
+--sender-domain DOMAIN  Filter by sender domain (exact match, case-insensitive)
+--search TEXT           Search subject and ticket text (substring)
 --limit N               Limit number of entries displayed
 --export FILE           Export filtered results to CSV file
 --stats-only            Show only summary statistics
@@ -141,6 +157,8 @@ python tools/fallback_viewer.py --date-range 30 --contains-pii --export pii_audi
 # Check for false positives (manual review of CSV)
 # Check for false negatives (sample non-PII tickets)
 python tools/fallback_viewer.py --date-range 30 --no-pii --limit 100
+
+**Sampling note:** The false-negative sample comes from the viewer population, defined as dictionary-shaped JSON entries successfully loaded by the viewer. A record_failed attempt may still appear as a complete-looking parseable entry, and the viewer cannot distinguish such an entry from a confirmed write, so the sample population does not exclude every record_failed attempt.
 ```
 
 **Metrics to Track:**
@@ -162,7 +180,7 @@ python tools/fallback_viewer.py --category hardware_issue --stats-only
 ```
 
 **Look for:**
-- Categories with high fallback rates
+- Categories with a high Human Routing Rate
 - Patterns in misclassifications
 - Need for new categories
 
@@ -220,8 +238,8 @@ after yesterday's update.
 ### Common Issues
 
 **Issue: "Warning: Log file not found"**
-- **Cause:** No fallback_log.jsonl file exists yet
-- **Solution:** Run classification first to generate logs, or specify different log path
+- **Cause:** No decision log files exist yet
+- **Solution:** Run classification first to generate logs, or specify a different log path
 - **Command:** `python tools/fallback_viewer.py --log-path path/to/your/log.jsonl`
 
 **Issue: "Warning: Skipping malformed log entry"**
@@ -243,7 +261,7 @@ after yesterday's update.
 ### Clause 9.1 - Monitoring, Measurement, Analysis
 
 **Requirements Met:**
-- ✅ Automated logging of low-confidence classifications
+- ✅ Automated logging of every controlled decision that reaches the logging step
 - ✅ Statistical analysis capabilities
 - ✅ Trend identification through date filtering
 - ✅ Category distribution tracking

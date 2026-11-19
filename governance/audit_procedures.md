@@ -57,14 +57,14 @@
 **Checklist Items:**
 
 - [ ] PII detection patterns are tested and effective
-- [ ] Confidence threshold (0.5) is appropriately set
-- [ ] Fallback logging captures all low-confidence cases
+- [ ] Routing threshold (0.7) is appropriately set
+- [ ] Every non-empty attempt that produces a controlled result and reaches the primary logging step receives a primary decision-record attempt. A record is confirmed only when persistence succeeds. Unexpected classification exceptions before the logging step have no primary record in JSONL v1.
 - [ ] Error logging captures all LLM failures
 - [ ] Risk register is reviewed and updated quarterly
 
 **Evidence Required:**
 - Test results from `tests/test_pii_filters.py`
-- Sample of `fallback_log.jsonl` entries
+- Sample of decision log entries (`logs/YYYY-MM-DD.jsonl`)
 - Sample of `governance/llm_error_log.jsonl` entries
 - Risk register review meeting minutes
 
@@ -120,7 +120,7 @@
 **Procedure:**
 
 1. **Sample Selection:**
-   - Randomly select 50 tickets from `fallback_log.jsonl`
+   - Randomly select 50 tickets from the viewer population, defined as dictionary-shaped JSON entries successfully loaded by the viewer
    - Include tickets with confidence scores: 0.0-0.3, 0.3-0.5, 0.5-0.7, 0.7-1.0
 
 2. **Human Review:**
@@ -145,6 +145,8 @@
 **Documentation:**
 Results logged in: `governance/audit_reports/accuracy_YYYY-MM-DD.json`
 
+**Sampling note:** A record_failed attempt may still appear as a complete-looking parseable entry, and the viewer cannot distinguish such an entry from a confirmed write, so the auditor must check GUI and result reporting for those cases separately and must not assume the sample population excludes every record_failed attempt. The Human Routing Rate and average confidence describe the available recorded population, not a guaranteed complete population of all attempts.
+
 ---
 
 ### 2.6 PII Detection Effectiveness
@@ -167,7 +169,7 @@ Results logged in: `governance/audit_reports/accuracy_YYYY-MM-DD.json`
    - Document common false positive patterns
 
 4. **False Negative Review:**
-   - Sample 100 tickets NOT flagged as PII
+   - Sample 100 decision log entries with contains_pii False
    - Manual review for missed PII
    - Calculate false negative rate
 
@@ -196,7 +198,7 @@ Results logged in: `governance/audit_reports/pii_detection_YYYY-MM-DD.json`
 
 2. **Review Categories:**
    - Count tickets by classification
-   - Identify categories with high fallback rates
+   - Identify categories with a high Human Routing Rate
    - Flag patterns indicating prompt tuning needs
 
 3. **Sample Deep Dive:**
@@ -358,9 +360,9 @@ if [ $ERROR_COUNT -gt 10 ]; then
     # Send notification
 fi
 
-# Check fallback log size
-FALLBACK_SIZE=$(wc -l < fallback_log.jsonl)
-echo "Fallback log entries: $FALLBACK_SIZE"
+# Check decision log size
+DECISION_LOG_SIZE=$(find logs -maxdepth 1 -name '*.jsonl' -exec cat {} + | wc -l)
+echo "Decision log entries: $DECISION_LOG_SIZE"
 ```
 
 **Weekly Monitoring:**

@@ -22,38 +22,62 @@ As a **Human Review Agent**, you are the quality assurance layer for the Vigil. 
 
 ---
 
-## 📊 Understanding the Fallback Log
+## 📊 Understanding the Decision Log
 
-### What is the Fallback Log?
+### What is the Decision Log?
 
-The `fallback_log.jsonl` file contains tickets that were automatically flagged for human review due to:
+The decision log holds every controlled decision that reaches the logging step, stored in per-day files under `logs/` (one file per day, `logs/YYYY-MM-DD.jsonl`). The viewer also reads the legacy `fallback_log.jsonl` when present. Every non-empty attempt that produces a controlled result and reaches the primary logging step receives a primary decision-record attempt. A record is confirmed only when persistence succeeds. An unexpected classification exception before a usable result reaches the logging step (classify_failed) has no primary record.
 
-- Low confidence scores (< 50%)
-- Category classified as "unknown"
-- System errors during classification
+The human queue is the human_agent route: a ticket whose routing decision is human_agent is queued for human review. Routing to human review means queued for human review, not reviewed, approved, assigned, or acted on.
 
-**Location:** `fallback_log.jsonl` (project root directory)
+Human Routing Rate equals human-routed completed classifier decisions divided by all completed classifier decisions represented by dictionary-shaped JSON entries successfully loaded by the viewer. API failures, PII preprocessing failures, and meaningful-text skips (model_skip True) are excluded from the denominator and reported separately. The viewer population is dictionary-shaped JSON entries successfully loaded by the viewer. The statistics describe the available recorded population, not a guaranteed complete population of all attempts.
+
+**Location:** `logs/YYYY-MM-DD.jsonl` (one file per day, under `logs/`)
 
 ### Log Entry Structure
 ```json
 {
+  "decision_id": "550e8400-e29b-41d4-a716-446655440000",
   "ticket": "User cannot access shared drive...",
   "result": {
+    "decision_id": "550e8400-e29b-41d4-a716-446655440000",
     "ticket_type": "access_request",
     "confidence_score": 0.42,
     "contains_pii": false,
+    "routing_decision": {
+      "route": "human_agent",
+      "reason": "Confidence 0.42 below threshold 0.7"
+    },
+    "api_failed": false,
     "model": "gemini-3.8-flash"
   },
-  "timestamp": "2025-11-25T14:23:45.123456+00:00"
+  "timestamp": "2025-11-25T14:23:45.123456+00:00",
+  "pii_types": [],
+  "subject": "Shared drive access",
+  "sender": "John Smith <[REDACTED_EMAIL]>",
+  "sender_domain": "example.com",
+  "source_ticket_id": "INC-12345"
 }
 ```
 
+The stored entry does not contain logging_failed, record_status, record_failure_category, or persistence_error_type. Those are diagnostics about a failed write, added to the returned result only, never stored in the entry. When a decision has an API failure, a preprocessing failure, or a meaningful-text skip, the entry carries api_failed, preprocessing_failed, or model_skip as applicable. The diagnostic error log entry carries decision_id when available, so it can be correlated to the primary decision record.
+
 **Fields Explained:**
-- `ticket` - The original ticket text
+- `decision_id` - Vigil-assigned UUIDv4, assigned when the ticket arrives; the same ID appears at the top level and inside the result
+- `ticket` - Redacted ticket text for the four pattern types (dashed SSN, card numbers that pass the Luhn check, email, US phone), not original text
 - `ticket_type` - AI's classification
 - `confidence_score` - AI's confidence (0.0 - 1.0)
 - `contains_pii` - Whether PII was detected
+- `routing_decision` - The route (human_agent or automated_response) and the reason
+- `api_failed` - Whether the model call failed and the ticket was routed to a human
+- `preprocessing_failed` - Present when PII preprocessing failed and the ticket was routed to a human
+- `model_skip` - Present and True when the ticket had no meaningful text after redaction and the model was skipped
+- `pii_types` - The PII types detected, when any
 - `timestamp` - When the ticket was classified
+- `subject` - Optional metadata supplied by the caller, redacted like ticket text
+- `sender` - Optional metadata supplied by the caller, redacted with the domain extracted. A name with an email address, for example "John Smith <john@example.com>", redacts to "John Smith <[REDACTED_EMAIL]>" and yields sender_domain "example.com". A bare email address, for example "john@example.com", redacts fully to "[REDACTED_EMAIL]" and yields sender_domain "example.com"; the stored sender value is the token, not searchable by address, by design. When several email addresses are present, the first one wins. A malformed address that does not match the pattern, for example "john@" or "john@example", is not detected, is not redacted, and yields no sender_domain.
+- `sender_domain` - The domain extracted from the sender, when one is present
+- `source_ticket_id` - An optional external reference supplied by the caller, stored verbatim after normalization (leading and trailing whitespace stripped) up to the 200-character limit, under a caller contract that prohibits credentials, personal information, and other sensitive values. It is not inherently safe, and it is listed as a residual privacy risk because the contract is unenforced and a caller can still supply a sensitive value, which Vigil stores verbatim.
 
 ---
 
@@ -312,7 +336,7 @@ Target: < 5%
 ```
 
 **Metric 4: Category Distribution**
-- Track which categories have highest fallback rates
+- Track which categories have the highest Human Routing Rate
 - Identify if certain categories need prompt tuning
 
 ---
@@ -361,7 +385,7 @@ Target: < 5%
    - Potential data leakage issues
 
 3. **System Performance Degradation**
-   - Significant increase in fallback rate
+   - Significant increase in Human Routing Rate
    - Average confidence scores dropping
 
 4. **Compliance Issues**
@@ -393,7 +417,7 @@ since VPN problems are typically access/authentication related.
 Suggestion: Add VPN-related keywords to access_request 
 training examples.
 
-Impact: Would reduce fallback rate by ~5% based on 
+Impact: Would reduce Human Routing Rate by ~5% based on 
 current volume.
 ```
 

@@ -31,7 +31,10 @@ This AI Policy establishes the governance framework for the Vigil, an LLM-powere
 
 ### 2.2 Transparency
 - Classification logic is auditable through configuration files
-- All decisions are logged with timestamps and confidence scores
+- Vigil attempts to create a primary decision record for every non-empty attempt that produces a controlled result and reaches the primary logging step. A record is confirmed only when persistence succeeds. Unexpected classification exceptions before that step have no primary record in JSONL v1.
+- Empty input produces no decision and no record.
+- An unexpected classification exception (classify_failed) before a usable result reaches the logging step has no primary record.
+- A failed write is reported in the result and GUI as "Persistence not confirmed", not silently hidden.
 - Model responses are traceable to specific prompts
 
 ### 2.3 Fairness and Non-Discrimination
