@@ -6,14 +6,17 @@ import re
 import shutil
 import uuid
 import pytest
+import httpx2
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch, MagicMock
+from google.genai import errors as genai_errors
 from bot_engine.router import (
     classify_ticket,
     evaluate_routing,
     _load_escalation_rules,
     load_config,
+    ModelOutputValidationError,
     process_llm_response,
     invoke_llm,
     prepare_prompt,
@@ -172,8 +175,8 @@ def test_classify_unknown_with_pii(mock_client):
 @patch('bot_engine.router.client')
 def test_llm_failure_fallback(mock_client):
     """Test the fallback mechanism when the LLM call fails."""
-    # Arrange: Simulate an exception from the LLM
-    mock_client.models.generate_content.side_effect = Exception("API Error")
+    # Arrange: Simulate a service failure from the LLM
+    mock_client.models.generate_content.side_effect = genai_errors.ServerError(503, {"error": {"message": "Service Unavailable"}})
 
     ticket_text = "My request is urgent."
 
@@ -328,7 +331,7 @@ def test_routing_escalates_confident_unknown():
 @patch('bot_engine.router.client')
 def test_llm_failure_redacts_pii_in_error_log(mock_client, tmp_path):
     """When the LLM fails on a PII ticket, the error log must not hold raw PII."""
-    mock_client.models.generate_content.side_effect = Exception("API Error")
+    mock_client.models.generate_content.side_effect = genai_errors.ServerError(503, {"error": {"message": "Service Unavailable"}})
 
     # Route logs and the prompt template at a scratch root so the test
     # never writes into the real repo.
@@ -582,7 +585,7 @@ def test_malformed_json_still_fails_closed(mock_client, mock_log_fallback, mock_
 @patch('bot_engine.router.client')
 def test_api_failure_sets_api_failed_flag(mock_client, mock_log_fallback, mock_log_error):
     """A raising LLM call produces api_failed True, unknown, and an error log entry."""
-    mock_client.models.generate_content.side_effect = Exception("API Error")
+    mock_client.models.generate_content.side_effect = genai_errors.ServerError(503, {"error": {"message": "Service Unavailable"}})
 
     result = classify_ticket("My request is urgent.")
 
@@ -888,7 +891,7 @@ def test_pii_ordering_redaction_failure_preserves_types(mock_client, mock_redact
 @patch('bot_engine.router.client')
 def test_pii_ordering_gemini_failure_with_pii_ticket(mock_client, tmp_path):
     """When Gemini fails on a PII ticket, both logs are redacted with correct types."""
-    mock_client.models.generate_content.side_effect = Exception("API Error")
+    mock_client.models.generate_content.side_effect = genai_errors.ServerError(503, {"error": {"message": "Service Unavailable"}})
     (tmp_path / "prompts").mkdir(exist_ok=True)
     shutil.copy(
         Path(__file__).parent.parent / "prompts" / "classification_prompt.txt",
@@ -1110,7 +1113,7 @@ def test_every_decision_logged_unknown_099(mock_client, tmp_path):
 @patch('bot_engine.router.client')
 def test_api_failure_writes_decision_and_error_entries(mock_client, tmp_path):
     """An API failure returns one decision entry with api_failed True and one error log entry."""
-    mock_client.models.generate_content.side_effect = ConnectionError("connection reset")
+    mock_client.models.generate_content.side_effect = httpx2.ConnectError("connection refused")
     with _tmp_project_root(tmp_path):
         result = classify_ticket("Please reset my password.")
     assert result["api_failed"] is True
@@ -1140,12 +1143,103 @@ def test_model_call_exception_boundary(mock_client, tmp_path):
         assert not (tmp_path / "logs").exists()
         assert not (tmp_path / "governance" / "llm_error_log.jsonl").exists()
         # A transport error from the provider call still returns an api_failed result.
-        mock_client.models.generate_content.side_effect = RuntimeError("socket closed")
+        # The mock is a real transport exception type (httpx2.ConnectError),
+        # not a generic stand-in, so the test exercises the narrowed handler.
+        mock_client.models.generate_content.side_effect = httpx2.ConnectError("connection refused")
         result = classify_ticket("Please reset my password.")
         assert result["api_failed"] is True
         assert result["record_status"] == "recorded"
         assert len(_read_day_entries(tmp_path)) == 1
         assert len(_read_error_entries(tmp_path)) == 1
+
+@patch('bot_engine.router.TICKET_TYPES', MOCK_TICKET_TYPES)
+@patch('bot_engine.router.client')
+def test_model_call_valueerror_from_prepare_prompt_propagates(mock_client, tmp_path):
+    """A ValueError from prepare_prompt propagates as classify_failed, not api_failed."""
+    _mock_llm(mock_client, "access_request", 0.99)
+    with _tmp_project_root(tmp_path):
+        with patch('bot_engine.router.prepare_prompt', side_effect=ValueError("template boom")):
+            with pytest.raises(ValueError):
+                classify_ticket("Please reset my password.")
+        assert not (tmp_path / "logs").exists()
+        assert not (tmp_path / "governance" / "llm_error_log.jsonl").exists()
+
+@patch('bot_engine.router.TICKET_TYPES', MOCK_TICKET_TYPES)
+@patch('bot_engine.router.client')
+def test_model_call_valueerror_from_strip_json_fence_propagates(mock_client, tmp_path):
+    """A ValueError from _strip_json_fence propagates as classify_failed, not api_failed."""
+    _mock_llm(mock_client, "access_request", 0.99)
+    with _tmp_project_root(tmp_path):
+        with patch('bot_engine.router._strip_json_fence', side_effect=ValueError("fence boom")):
+            with pytest.raises(ValueError):
+                classify_ticket("Please reset my password.")
+        assert not (tmp_path / "logs").exists()
+        assert not (tmp_path / "governance" / "llm_error_log.jsonl").exists()
+
+@patch('bot_engine.router.TICKET_TYPES', MOCK_TICKET_TYPES)
+@patch('bot_engine.router.client')
+def test_model_call_attributeerror_propagates(mock_client, tmp_path):
+    """An AttributeError in prompt preparation or response processing propagates as classify_failed."""
+    _mock_llm(mock_client, "access_request", 0.99)
+    with _tmp_project_root(tmp_path):
+        with patch('bot_engine.router.prepare_prompt', side_effect=AttributeError("prompt boom")):
+            with pytest.raises(AttributeError):
+                classify_ticket("Please reset my password.")
+        assert not (tmp_path / "logs").exists()
+        assert not (tmp_path / "governance" / "llm_error_log.jsonl").exists()
+        with patch('bot_engine.router.process_llm_response', side_effect=AttributeError("response boom")):
+            with pytest.raises(AttributeError):
+                classify_ticket("Please reset my password.")
+        assert not (tmp_path / "logs").exists()
+        assert not (tmp_path / "governance" / "llm_error_log.jsonl").exists()
+
+@patch('bot_engine.router.TICKET_TYPES', MOCK_TICKET_TYPES)
+@patch('bot_engine.router.client')
+def test_provider_call_programming_error_propagates(mock_client, tmp_path):
+    """A programming error from the provider call itself propagates as classify_failed, not api_failed."""
+    _mock_llm(mock_client, "access_request", 0.99)
+    with _tmp_project_root(tmp_path):
+        mock_client.models.generate_content.side_effect = TypeError("bad argument")
+        with pytest.raises(TypeError):
+            classify_ticket("Please reset my password.")
+        assert not (tmp_path / "logs").exists()
+        assert not (tmp_path / "governance" / "llm_error_log.jsonl").exists()
+
+@patch('bot_engine.router.TICKET_TYPES', MOCK_TICKET_TYPES)
+@patch('bot_engine.router.client')
+def test_provider_timeout_is_api_failed(mock_client, tmp_path):
+    """A timeout from the provider call returns an api_failed result that is recorded."""
+    _mock_llm(mock_client, "access_request", 0.99)
+    with _tmp_project_root(tmp_path):
+        mock_client.models.generate_content.side_effect = httpx2.TimeoutException("timed out")
+        result = classify_ticket("Please reset my password.")
+        assert result["api_failed"] is True
+        assert result["record_status"] == "recorded"
+        assert len(_read_day_entries(tmp_path)) == 1
+
+@patch('bot_engine.router.TICKET_TYPES', MOCK_TICKET_TYPES)
+@patch('bot_engine.router.client')
+def test_provider_client_error_is_api_failed(mock_client, tmp_path):
+    """A 4xx service error from the provider call returns an api_failed result that is recorded."""
+    _mock_llm(mock_client, "access_request", 0.99)
+    with _tmp_project_root(tmp_path):
+        mock_client.models.generate_content.side_effect = genai_errors.ClientError(400, {"error": {"message": "Bad request"}})
+        result = classify_ticket("Please reset my password.")
+        assert result["api_failed"] is True
+        assert result["record_status"] == "recorded"
+        assert len(_read_day_entries(tmp_path)) == 1
+
+@patch('bot_engine.router.client')
+def test_malformed_json_raises_controlled_validation_error(mock_client):
+    """Malformed JSON raises the dedicated controlled validation failure type, a ValueError subclass."""
+    mock_response = MagicMock()
+    mock_response.text = "not json at all"
+    mock_client.models.generate_content.return_value = mock_response
+
+    with pytest.raises(ModelOutputValidationError) as excinfo:
+        invoke_llm("Classify this ticket.")
+
+    assert "LLM returned malformed JSON" in str(excinfo.value)
 
 @patch('bot_engine.router.TICKET_TYPES', MOCK_TICKET_TYPES)
 @patch('bot_engine.router.client')
@@ -1413,7 +1507,7 @@ def test_unexpected_persistence_exception(mock_client, tmp_path):
 @patch('bot_engine.router.client')
 def test_diagnostic_log_failure_does_not_block_primary(mock_client, tmp_path):
     """A diagnostic log_llm_error raising OSError does not block the primary record or set its outcome."""
-    mock_client.models.generate_content.side_effect = ConnectionError("connection reset")
+    mock_client.models.generate_content.side_effect = httpx2.ConnectError("connection refused")
     with _tmp_project_root(tmp_path):
         with patch('bot_engine.router.log_llm_error', side_effect=OSError("diagnostic disk full")):
             result = classify_ticket("Please reset my password.")
@@ -1428,7 +1522,7 @@ def test_diagnostic_log_failure_does_not_block_primary(mock_client, tmp_path):
 def test_diagnostic_preparation_failure_does_not_block_primary(mock_client, tmp_path):
     """A redact_pii failure inside log_llm_error does not block the primary record."""
     from bot_engine.router import redact_pii as real_redact
-    mock_client.models.generate_content.side_effect = ConnectionError("connection reset")
+    mock_client.models.generate_content.side_effect = httpx2.ConnectError("connection refused")
     def scoped_redact(text):
         if "API call to Gemini failed" in text:
             raise RuntimeError("redaction boom")
@@ -1446,7 +1540,7 @@ def test_diagnostic_preparation_failure_does_not_block_primary(mock_client, tmp_
 @patch('bot_engine.router.client')
 def test_error_log_carries_decision_id(mock_client, tmp_path):
     """An API failure writes an error log entry whose decision_id matches the primary decision_id."""
-    mock_client.models.generate_content.side_effect = ConnectionError("connection reset")
+    mock_client.models.generate_content.side_effect = httpx2.ConnectError("connection refused")
     with _tmp_project_root(tmp_path):
         result = classify_ticket("Please reset my password.")
     error_entries = _read_error_entries(tmp_path)
@@ -1469,7 +1563,7 @@ def test_direct_error_log_without_decision_id_omits_key(tmp_path):
 @patch('bot_engine.router.client')
 def test_unexpected_diagnostic_exception_does_not_block_primary(mock_client, tmp_path):
     """A log_llm_error raising RuntimeError does not block the primary record and the result is returned."""
-    mock_client.models.generate_content.side_effect = ConnectionError("connection reset")
+    mock_client.models.generate_content.side_effect = httpx2.ConnectError("connection refused")
     with _tmp_project_root(tmp_path):
         with patch('bot_engine.router.log_llm_error', side_effect=RuntimeError("diagnostic boom")):
             result = classify_ticket("Please reset my password.")

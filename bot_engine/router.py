@@ -1,3 +1,4 @@
+import importlib
 import json
 import os
 import uuid
@@ -5,6 +6,8 @@ import yaml
 from pathlib import Path
 from dotenv import load_dotenv
 from google import genai
+from google.auth import exceptions as auth_exceptions
+from google.genai import errors as genai_errors
 from google.genai import types
 from risk_controls.pii_filters import redact_pii, detect_pii_types, REDACTION_TOKENS, PII_PATTERNS
 from datetime import datetime, timezone
@@ -60,6 +63,54 @@ except (TypeError, ValueError) as e:
     print(f"Error: Gemini API key not configured. Please set GEMINI_API_KEY in a .env file. Details: {e}")
     client = None
 
+
+class ModelOutputValidationError(ValueError):
+    """A controlled model-output validation failure.
+
+    Raised only for output the model returned that fails validation:
+    malformed JSON, a non-numeric confidence, or a confidence outside
+    0.0 to 1.0. It is a ValueError subclass, so direct callers that catch
+    ValueError still see it. The model block in classify_ticket catches
+    this type specifically, so a plain ValueError from prompt preparation
+    or response processing is a programming error and propagates as
+    classify_failed instead of becoming api_failed.
+    """
+
+
+def _provider_error_types() -> tuple[type[Exception], ...]:
+    """Exception types the provider call raises for a genuine failure.
+
+    Service failures surface as google.genai.errors.APIError (ClientError
+    for 4xx, ServerError for 5xx) or as UnknownApiResponseError when the
+    service returns a response the SDK cannot interpret. Transport
+    failures surface as the installed HTTP library's TransportError
+    (httpx or its httpx2 fork; the active transport in this environment
+    is httpx2). A google-auth TransportError is included for the
+    credential-refresh path; the configured authentication is an API key,
+    so no refresh runs and that type is not expected to occur, but it is
+    a genuine transport failure the SDK treats as transient. A
+    programming error in the call itself (for example a TypeError from a
+    bad argument) is not in this set, so it propagates as classify_failed
+    instead of being relabelled as an API failure.
+    """
+    types: list[type[Exception]] = [
+        genai_errors.APIError,
+        genai_errors.UnknownApiResponseError,
+    ]
+    for library in ("httpx", "httpx2"):
+        try:
+            module = importlib.import_module(library)
+        except ImportError:
+            continue
+        transport_error = getattr(module, "TransportError", None)
+        if transport_error is not None:
+            types.append(transport_error)
+    types.append(auth_exceptions.TransportError)
+    return tuple(types)
+
+
+_PROVIDER_ERROR_TYPES = _provider_error_types()
+
 # --- Core Functions ---
 
 def prepare_prompt(ticket_text: str) -> str:
@@ -86,12 +137,16 @@ def _strip_json_fence(response_text: str) -> str:
 def invoke_llm(prompt: str) -> dict:
     """Invokes the Gemini model and returns the parsed JSON response.
 
-    Only the provider call itself is wrapped in the broad handler: any
-    exception from the provider call is a provider failure and is reported
-    as a ConnectionError. Response handling sits outside that handler, so a
-    programming error in _strip_json_fence propagates instead of being
-    relabelled as an API failure. Malformed JSON from the model is a
-    controlled model-output validation failure and raises ValueError.
+    Only the provider call itself is wrapped in the provider-failure
+    handler, and only the identifiable provider failure types in
+    _PROVIDER_ERROR_TYPES are converted to a ConnectionError, so a
+    programming error in the call itself propagates instead of being
+    relabelled as an API failure. Response handling sits outside that
+    handler. Fence stripping and JSON parsing are distinct operations:
+    a programming error in _strip_json_fence propagates as
+    classify_failed, while malformed JSON from the model is a controlled
+    model-output validation failure that raises
+    ModelOutputValidationError.
     """
     if not client:
         raise ConnectionError("Gemini client is not initialized. Check API key.")
@@ -105,7 +160,7 @@ def invoke_llm(prompt: str) -> dict:
                 http_options=types.HttpOptions(timeout=30000)
             )
         )
-    except Exception as e:
+    except _PROVIDER_ERROR_TYPES as e:
         raise ConnectionError(f"API call to Gemini failed: {e}") from e
     # Extract text from response
     response_text = _strip_json_fence(response.text)
@@ -113,13 +168,14 @@ def invoke_llm(prompt: str) -> dict:
     try:
         return json.loads(response_text)
     except json.JSONDecodeError as e:
-        raise ValueError(f"LLM returned malformed JSON: {response_text[:200]}") from e
+        raise ModelOutputValidationError(f"LLM returned malformed JSON: {response_text[:200]}") from e
 
 def process_llm_response(result: dict) -> tuple[str, float]:
     """Extracts and validates category and confidence from the LLM response.
 
     A non-numeric confidence is a model-output validation failure and
-    raises ValueError, the same as a confidence outside 0.0 to 1.0.
+    raises ModelOutputValidationError, the same as a confidence outside
+    0.0 to 1.0.
     """
     category = result.get("category", "unknown")
     confidence = result.get("confidence", 0.0)
@@ -131,9 +187,9 @@ def process_llm_response(result: dict) -> tuple[str, float]:
     try:
         confidence = float(confidence)
     except (TypeError, ValueError):
-        raise ValueError(f"LLM returned non-numeric confidence: {confidence!r}")
+        raise ModelOutputValidationError(f"LLM returned non-numeric confidence: {confidence!r}")
     if not 0.0 <= confidence <= 1.0:
-        raise ValueError(f"LLM returned confidence outside 0.0 to 1.0: {confidence}")
+        raise ModelOutputValidationError(f"LLM returned confidence outside 0.0 to 1.0: {confidence}")
 
     return category, confidence
 
@@ -493,11 +549,17 @@ def classify_ticket(ticket_text: str, subject=None, sender=None, source_ticket_i
     for token in REDACTION_TOKENS.values():
         remaining = remaining.replace(token, "")
     if remaining.strip():
+        # Prompt preparation sits outside the try: a programming error
+        # here (for example a ValueError from a malformed prompt template)
+        # is an unexpected classification exception and propagates as
+        # classify_failed, not an API failure. Only the model call and
+        # response processing are inside, and only their controlled
+        # failures become api_failed.
+        prompt = prepare_prompt(redacted_text)
         try:
-            prompt = prepare_prompt(redacted_text)
             llm_result = invoke_llm(prompt)
             category, confidence = process_llm_response(llm_result)
-        except (ConnectionError, ValueError) as e:
+        except (ConnectionError, ModelOutputValidationError) as e:
             api_failed = True
             try:
                 log_llm_error(ticket_text, str(e), decision_id=decision_id)
